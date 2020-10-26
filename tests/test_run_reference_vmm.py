@@ -4,7 +4,15 @@
 
 import os, signal, subprocess, time
 import pytest
+from subprocess import PIPE, STDOUT
 
+def process_exists(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    else:
+        return True
 
 def test_reference_vmm():
     """Start the reference VMM and trust that it works."""
@@ -32,15 +40,22 @@ def test_reference_vmm():
         ),
         "--vcpus", "num_vcpus={}".format(num_vcpus)
     ]
-    
-    # We can't talk to the reference VMM yet, and it can't talk back.
-    # If we try to capture the output, Python doesn't return control to the
-    # test until the child process ends, which it doesn't. So we have to trust
-    # that the output is there, let the VMM run for a bit, then kill it.
-    # In the future, it will communicate via metrics / devices.
-    vmm_process = subprocess.Popen(vmm_cmd)
-    vmm_pid = vmm_process.pid
+
+    vmm_process = subprocess.Popen(vmm_cmd, stdout=PIPE, stdin=PIPE)
+    # While the process is still running, the vmm_process.returncode is None.
+    assert(vmm_process.returncode == None)
+    assert(process_exists(vmm_process.pid == True))
+
+    # Poll process for new output until we find the hello world message.
+    # If we do not find the expected message, this loop will not break and the
+    # test will fail when the timeout expires.
+    while True:
+        nextline = vmm_process.stdout.readline()
+        if "Hello, world, from the rust-vmm reference VMM!" in nextline.decode():
+            break
+
+    vmm_process.stdin.write(b'reboot -f\n')
+    vmm_process.stdin.flush()
 
     time.sleep(3)
-
-    os.kill(vmm_pid, signal.SIGHUP)
+    assert(process_exists(vmm_process.pid == False))
