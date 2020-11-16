@@ -163,3 +163,123 @@ impl KvmVm {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::vcpu::mptable::MAX_SUPPORTED_CPUS;
+    use crate::vm::{Error, KvmVm, VmState};
+    use kvm_ioctls::Kvm;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    #[test]
+    fn test_failed_setup_mptable() {
+        let kvm = Kvm::new().unwrap();
+
+        let vm_state = VmState {
+            num_vcpus: (MAX_SUPPORTED_CPUS + 1) as u8,
+        };
+
+        let mem_size = (128 << 20) as usize;
+        let guest_memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
+
+        let res = KvmVm::new(&kvm, vm_state, &guest_memory);
+        match res {
+            Err(Error::Mptable(_)) => {}
+            _ => assert!(
+                false,
+                "Creating KvmVm::new call did not fail as expected (mptable)."
+            ),
+        };
+    }
+
+    #[test]
+    fn test_failed_setup_memory() {
+        let kvm = Kvm::new().unwrap();
+        let vm_state = VmState { num_vcpus: 1 };
+
+        // Create nr_slots non overlapping regions of length 100.
+        let nr_slots: u64 = (kvm.get_nr_memslots() + 1) as u64;
+        let mut ranges = Vec::<(GuestAddress, usize)>::new();
+        for i in 0..nr_slots {
+            ranges.push((GuestAddress(i * 100), 100))
+        }
+        let guest_memory = GuestMemoryMmap::from_ranges(&ranges).unwrap();
+        let res = KvmVm::new(&kvm, vm_state, &guest_memory);
+
+        match res {
+            Err(Error::NotEnoughMemorySlots) => {}
+            _ => assert!(
+                false,
+                "Creating KvmVm::new call did not fail as expected (guest memory)."
+            ),
+        };
+    }
+
+    #[test]
+    fn test_failed_irqchip_setup() {
+        let kvm = Kvm::new().unwrap();
+        let vm_state = VmState { num_vcpus: 1 };
+
+        let vm = KvmVm {
+            vcpus: Vec::new(),
+            vcpu_handles: Vec::new(),
+            state: vm_state,
+            fd: kvm.create_vm().unwrap(),
+        };
+
+        vm.setup_irq_controller().unwrap();
+        let res = vm.setup_irq_controller();
+        match res {
+            Err(Error::SetupInterruptController(_)) => {}
+            _ => {
+                assert!(
+                    false,
+                    "Setting up the interrupt controller did not fail as expected."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_vcpu() {
+        let num_vcpus = 2;
+
+        let kvm = Kvm::new().unwrap();
+        let vm_state = VmState { num_vcpus };
+
+        let mem_size = (128 << 20) as usize;
+        let guest_memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
+
+        let mut vm = KvmVm::new(&kvm, vm_state, &guest_memory).unwrap();
+        let io_manager = Arc::new(IoManager::new());
+
+        for i in 0..vm.state.num_vcpus {
+            // We're creating a dummy Vcpu.
+            vm.create_vcpu(
+                io_manager.clone(),
+                VcpuState {
+                    zero_page_start: 0,
+                    cpuid: kvm.get_supported_cpuid(256).unwrap(),
+                    id: i,
+                    kernel_load_addr: GuestAddress(0),
+                },
+                &guest_memory,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(vm.vcpus.len() as u8, num_vcpus);
+        assert_eq!(vm.vcpu_handles.len() as u8, 0);
+
+        // We added no code to run, the vcpus should immediately exit.
+        vm.run().unwrap();
+        assert_eq!(vm.vcpus.len() as u8, 0);
+        assert_eq!(vm.vcpu_handles.len() as u8, num_vcpus);
+
+        for vcpu in vm.vcpu_handles.drain(..) {
+            let _ = vcpu.join().unwrap();
+        }
+    }
+}
