@@ -44,8 +44,6 @@ pub enum Error {
     IO(io::Error),
     /// Error issuing an ioctl to KVM.
     KvmIoctl(kvm_ioctls::Error),
-    /// Failed to configure mptables.
-    Mptable(mptable::Error),
     /// Failed to configure MSRs.
     SetModelSpecificRegistersCount,
 }

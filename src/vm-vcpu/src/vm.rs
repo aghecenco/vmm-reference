@@ -1,3 +1,4 @@
+use crate::vcpu::mptable;
 use crate::vcpu::{self, KvmVcpu, VcpuState};
 use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region, KVM_PIT_SPEAKER_DUMMY};
 use kvm_ioctls::{Kvm, VmFd};
@@ -6,8 +7,13 @@ use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 use vm_device::device_manager::IoManager;
-use vm_memory::GuestMemory;
+use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd;
+
+/// Defines the state from which a `KvmVm` is initialized.
+pub struct VmState {
+    pub num_vcpus: u8,
+}
 
 /// A KVM specific implementation of a Virtual Machine.
 ///
@@ -15,6 +21,7 @@ use vmm_sys_util::eventfd::EventFd;
 /// this type will become on of the concrete implementations.
 pub struct KvmVm {
     fd: VmFd,
+    state: VmState,
     // Only one of `vcpus` or `vcpu_handles` can be active at a time.
     // To create the `vcpu_handles` the `vcpu` vector is drained.
     // A better abstraction should be used to represent this behavior.
@@ -28,6 +35,8 @@ pub enum Error {
     CreateVm(kvm_ioctls::Error),
     /// Failed to setup the user memory regions.
     SetupMemoryRegion(kvm_ioctls::Error),
+    /// Not enough memory slots.
+    NotEnoughMemorySlots,
     /// Failed to setup the interrupt controller.
     SetupInterruptController(kvm_ioctls::Error),
     /// Failed to create the vcpu.
@@ -35,6 +44,8 @@ pub enum Error {
     /// Failed to register IRQ event.
     RegisterIrqEvent(kvm_ioctls::Error),
     RunVcpus(io::Error),
+    /// Failed to configure mptables.
+    Mptable(mptable::Error),
 }
 
 // TODO: Implement std::error::Error for Error.
@@ -44,29 +55,59 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl KvmVm {
     /// Create a new `KvmVm`.
-    pub fn new(kvm: &Kvm) -> Result<Self> {
-        let fd = kvm.create_vm().map_err(Error::CreateVm)?;
-        Ok(KvmVm {
-            fd,
+    pub fn new<M: GuestMemory>(kvm: &Kvm, vm_state: VmState, guest_memory: &M) -> Result<Self> {
+        let vm_fd = kvm.create_vm().map_err(Error::CreateVm)?;
+
+        let vm = KvmVm {
+            state: vm_state,
+            fd: vm_fd,
             vcpus: Vec::new(),
             vcpu_handles: Vec::new(),
-        })
-    }
-    /// Set the user memory region.
-    // This function can be easily be part of the hypervisor agnostic interface once we
-    // redefine `memory_region` such that it does not use KVM primitives.
-    pub unsafe fn set_user_memory_region(
-        &self,
-        memory_region: kvm_userspace_memory_region,
-    ) -> Result<()> {
-        self.fd
-            .set_user_memory_region(memory_region)
-            .map_err(Error::SetupMemoryRegion)
+        };
+
+        vm.configure_memory_regions(guest_memory, kvm)?;
+
+        mptable::setup_mptable(guest_memory, vm.state.num_vcpus).map_err(Error::Mptable)?;
+
+        vm.setup_irq_controller()?;
+
+        Ok(vm)
     }
 
-    /// Configures the in kernel interrupt controller.
+    // Create the kvm memory regions based on the configuration passed as `guest_memory`.
+    fn configure_memory_regions<M: GuestMemory>(&self, guest_memory: &M, kvm: &Kvm) -> Result<()> {
+        if guest_memory.num_regions() > kvm.get_nr_memslots() {
+            return Err(Error::NotEnoughMemorySlots);
+        }
+
+        // Register guest memory regions with KVM.
+        guest_memory
+            .with_regions(|index, region| {
+                let memory_region = kvm_userspace_memory_region {
+                    slot: index as u32,
+                    guest_phys_addr: region.start_addr().raw_value(),
+                    memory_size: region.len() as u64,
+                    // It's safe to unwrap because the guest address is valid.
+                    userspace_addr: guest_memory.get_host_address(region.start_addr()).unwrap()
+                        as u64,
+                    flags: 0,
+                };
+
+                // Safe because:
+                // * userspace_addr is a valid address for a memory region, obtained by calling
+                //   get_host_address() on a valid region's start address;
+                // * the memory regions do not overlap - there's either a single region spanning
+                //   the whole guest memory, or 2 regions with the MMIO gap in between.
+                unsafe { self.fd.set_user_memory_region(memory_region) }
+            })
+            .map_err(Error::SetupMemoryRegion)?;
+
+        Ok(())
+    }
+
+    // Configures the in kernel interrupt controller.
     // This function should be reuse to configure the aarch64 interrupt controller (GIC).
-    pub fn setup_irq_controller(&self) -> Result<()> {
+    fn setup_irq_controller(&self) -> Result<()> {
         // First, create the irqchip.
         // On `x86_64`, this _must_ be created _before_ the vCPUs.
         // It sets up the virtual IOAPIC, virtual PIC, and sets up the future vCPUs for local APIC.
