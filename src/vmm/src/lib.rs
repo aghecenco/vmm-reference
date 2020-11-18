@@ -9,10 +9,11 @@
 use std::convert::TryFrom;
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, stdin, stdout};
+use std::io::{self, stdin, stdout, Write};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
-use event_manager::{EventManager, MutEventSubscriber, SubscriberOps};
+use event_manager::{EventManager, EventSubscriber, MutEventSubscriber, SubscriberOps};
 use kvm_bindings::{KVM_API_VERSION, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{
     Cap::{self, Ioeventfd, Irqchip, Irqfd, UserMemory},
@@ -24,6 +25,7 @@ use linux_loader::configurator::{
     self, linux::LinuxBootConfigurator, BootConfigurator, BootParams,
 };
 use linux_loader::loader::{self, elf::Elf, load_cmdline, KernelLoader, KernelLoaderResult};
+use vm_device::bus::{BusManager, PioAddress};
 use vm_device::device_manager::IoManager;
 use vm_device::resources::Resource;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
@@ -39,7 +41,7 @@ mod config;
 pub use config::*;
 
 mod devices;
-use devices::SerialWrapper;
+use devices::{SerialWrapper, WithInterruptNotification};
 
 /// First address past 32 bits.
 const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
@@ -99,6 +101,12 @@ impl std::convert::From<vm::Error> for Error {
 /// Dedicated [`Result`](https://doc.rust-lang.org/std/result/) type.
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub(crate) trait DormantDevice: WithInterruptNotification + MutEventSubscriber {}
+
+impl<W: Write> DormantDevice for SerialWrapper<W> {}
+impl<T: DormantDevice + EventSubscriber + ?Sized> DormantDevice for Arc<T> {}
+impl<T: DormantDevice + MutEventSubscriber + ?Sized> DormantDevice for Mutex<T> {}
+
 /// A live VMM.
 pub struct VMM {
     kvm: Kvm,
@@ -112,6 +120,7 @@ pub struct VMM {
     // perspective, and a dyn MutEventSubscriber from EventManager's) is managed by the 2 entities,
     // and isn't Copy-able; so once one of them gets ownership, the other one can't anymore.
     event_mgr: EventManager<Arc<Mutex<dyn MutEventSubscriber>>>,
+    dormant_devices: Vec<Arc<Mutex<dyn DormantDevice>>>,
 }
 
 impl VMM {
@@ -140,6 +149,7 @@ impl VMM {
             guest_memory,
             device_mgr: Some(IoManager::new()),
             event_mgr: EventManager::new().map_err(Error::EventManager)?,
+            dormant_devices: vec![],
         };
 
         vmm.configure_pio_devices()?;
@@ -235,10 +245,6 @@ impl VMM {
             stdout(),
         ))));
 
-        // Register its interrupt fd with KVM. IRQ line 4 is typically used for serial port 1.
-        // See more IRQ assignments & info: https://tldp.org/HOWTO/Serial-HOWTO-8.html
-        self.vm.register_irqfd(&interrupt_evt, 4)?;
-
         // Put it on the bus.
         // Safe to use expect() because the device manager is instantiated in new(), there's no
         // default implementation, and the field is private inside the VMM struct.
@@ -253,9 +259,6 @@ impl VMM {
                 }],
             )
             .unwrap();
-
-        // Hook it to event management.
-        self.event_mgr.add_subscriber(serial);
 
         Ok(())
     }
@@ -302,6 +305,19 @@ impl VMM {
     pub fn run(&mut self) {
         if stdin().lock().set_raw_mode().is_err() {
             eprintln!("Failed to set raw mode on terminal. Stdin will echo.");
+        }
+
+        // Bring the devices to life (or, rather, to the hypervisor).
+        for device in self.dormant_devices.drain(..) {
+            // IRQ fd.
+            <dyn DormantDevice as WithInterruptNotification>::setup_interrupt_notif(
+                &device,
+                &mut self.vm,
+            )
+            .unwrap();
+
+            // std::sync::Arc<std::sync::Mutex<(dyn event_manager::MutEventSubscriber + 'static)>>
+            self.event_mgr.add_subscriber(device);
         }
 
         // TODO: should we handle this in another way rather than a panic?

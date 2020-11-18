@@ -5,6 +5,8 @@
 
 use std::convert::TryInto;
 use std::io::{stdin, Read, Write};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
 use vm_device::{
@@ -12,6 +14,7 @@ use vm_device::{
     MutDevicePio,
 };
 use vm_superio::Serial;
+use vm_vcpu::vm::KvmVm;
 use vmm_sys_util::epoll::EventSet;
 
 /// Newtype for implementing `event-manager` functionalities.
@@ -82,4 +85,37 @@ impl<W: Write> MutDevicePio for SerialWrapper<W> {
 pub enum Error {
     /// Failed to create an event manager for device events.
     EventManager(event_manager::Error),
+    /// Failed to set up interrupt notification.
+    InterruptNotification(vm_vcpu::vm::Error),
+}
+
+// TODO: move to vm-device?
+pub(crate) trait WithInterruptNotification {
+    // TODO: abstractize the KvmVm into a KVM-agnostic hypervisor trait.
+    fn setup_interrupt_notif(&self, vm: &mut KvmVm) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+impl<W: Write> WithInterruptNotification for SerialWrapper<W> {
+    fn setup_interrupt_notif(&self, vm: &mut KvmVm) -> Result<(), Error> {
+        // Register an interrupt fd with KVM. IRQ line 4 is typically used for serial port 1.
+        // See more IRQ assignments & info: https://tldp.org/HOWTO/Serial-HOWTO-8.html
+        vm.register_irqfd(self.0.interrupt_evt(), 4)
+            .map_err(Error::InterruptNotification)
+    }
+}
+
+// Blanket implementation for Arc<T>.
+impl<T: WithInterruptNotification + ?Sized> WithInterruptNotification for Arc<T> {
+    fn setup_interrupt_notif(&self, vm: &mut KvmVm) -> Result<(), Error> {
+        self.deref().setup_interrupt_notif(vm)
+    }
+}
+
+// Blanket implementation for Mutex<T>.
+impl<T: WithInterruptNotification + ?Sized> WithInterruptNotification for Mutex<T> {
+    fn setup_interrupt_notif(&self, vm: &mut KvmVm) -> Result<(), Error> {
+        self.lock().unwrap().setup_interrupt_notif(vm)
+    }
 }
