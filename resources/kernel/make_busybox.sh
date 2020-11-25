@@ -115,7 +115,18 @@ mount -t sysfs none /sys
 EOF
 
     if [ -z "$halt" ]; then
-        echo "setsid /bin/sh -c 'exec /bin/sh </dev/ttyS0 >/dev/ttyS0 2>&1'" >>init
+        cat >>init <<EOF
+# Configure loopback.
+/sbin/ifconfig lo 127.0.0.1
+# Configure eth0.
+/sbin/ip addr add 192.168.241.2/30 dev eth0
+/sbin/ip link set eth0 up
+/sbin/ip route add default via 192.168.241.1 dev eth0
+# Start http server.
+/usr/sbin/httpd -p 80 -h /www
+# Profit!
+setsid /bin/sh -c 'exec /bin/sh </dev/ttyS0 >/dev/ttyS0 2>&1'
+EOF
     else
         echo "exec /sbin/halt" >>init
     fi
@@ -145,6 +156,11 @@ make_initramfs() {
 
     chmod +x init
     fakeroot chown root init
+
+    # Add webserver files.
+    resdir=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+    mkdir -p www
+    cp -R "$resdir/www"/* www/
 
     # Pack it up...
     echo "Packing initramfs.cpio..."
