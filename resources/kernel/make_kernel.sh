@@ -95,6 +95,11 @@ make_initramfs() {
     chmod +x init
     fakeroot chown root init
 
+    # Add webserver files.
+    resdir=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+    mkdir -p www
+    cp -R "$resdir/www"/* www/
+
     # Pack it up...
     echo "Packing initramfs.cpio..."
     find . | cpio -H newc -o > ../initramfs.cpio
