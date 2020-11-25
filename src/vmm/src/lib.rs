@@ -239,18 +239,11 @@ impl VMM {
 
         // Load the kernel command line into guest memory.
 
-        // Temporary hardcoded snippet used to enable the discovery of a virtio MMIO block
-        // device, and mark /dev/vda as the root device, using irq 5.
-        kernel_cfg.cmdline.push_str(&format!(
-            " virtio_mmio.device=4K@0x{:x}:5 root=/dev/vda",
-            MMIO_MEM_START
-        ));
-
         // Temporary hardcoded snippet used to enable the discovery of a virtio MMIO net
-        // device using irq 6.
+        // device using irq 5.
         kernel_cfg.cmdline.push_str(&format!(
-                " virtio_mmio.device=4K@0x{:x}:6",
-                MMIO_MEM_START + 0x1000
+                " virtio_mmio.device=4K@0x{:x}:5",
+                MMIO_MEM_START
             ));
 
         let mut cmdline = Cmdline::new(kernel_cfg.cmdline.len() + 1);
@@ -341,34 +334,10 @@ impl VMM {
     fn temp_add_devs(&mut self) -> Result<()> {
         let mem = Arc::new(self.guest_memory.clone());
 
-        // Insert a hardcoded block.
+        // Insert a hardcoded net.
         {
             let range = MmioRange::new(MmioAddress(MMIO_MEM_START), 0x1000).unwrap();
             let mmio_cfg = MmioConfig { range, gsi: 5 };
-
-            let args = BlockArgs {
-                mem: mem.clone(),
-                endpoint: self.event_mgr.remote_endpoint(),
-                vm_fd: self.vm_fd.clone(),
-                mmio_cfg,
-                file_path: "disk.ext4".to_owned(),
-            };
-
-            let b = Arc::new(Mutex::new(
-                Block::new(args).expect("failed to create block"),
-            ));
-
-            self.device_mgr
-                .as_mut()
-                .unwrap()
-                .register_mmio(range, b)
-                .unwrap();
-        }
-
-        // Insert a hardcoded net.
-        {
-            let range = MmioRange::new(MmioAddress(MMIO_MEM_START + 0x1000), 0x1000).unwrap();
-            let mmio_cfg = MmioConfig { range, gsi: 6 };
 
             let args = NetArgs {
                 mem: mem.clone(),
