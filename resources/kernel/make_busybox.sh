@@ -6,6 +6,7 @@
 # This script illustrates the build steps for `vmlinux-hello-busybox`.
 
 set -e
+set -x
 
 WORKDIR="/tmp/vmlinux_busybox"
 SOURCE=$(readlink -f "$0")
@@ -56,9 +57,11 @@ extract_kernel_srcs() {
     echo "Starting kernel build."
     # Download kernel sources.
     echo "Downloading kernel..."
-    curl "$KERNEL_URL" > "$KERNEL_ARCHIVE"
-    echo "Extracting kernel sources..."
-    tar xf "$KERNEL_ARCHIVE"
+    if [ ! -f "$KERNEL_ARCHIVE" ]; then
+        curl "$KERNEL_URL" > "$KERNEL_ARCHIVE"
+        echo "Extracting kernel sources..."
+        tar xf "$KERNEL_ARCHIVE"
+    fi
 }
 
 make_kernel_config() {
@@ -75,11 +78,13 @@ make_busybox() {
     # Move to the directory with the kernel sources.
     pushd "$kernel_dir" &>/dev/null
     # Prepare busybox.
-    echo "Downloading busybox..."
-    mkdir -p busybox_rootfs
-    curl "$BUSYBOX_URL" > "$BUSYBOX_ARCHIVE"
-    echo "Extracting busybox..."
-    tar xf "$BUSYBOX_ARCHIVE"
+    if [ ! -f "$BUSYBOX_ARCHIVE" ]; then
+        echo "Downloading busybox..."
+        mkdir -p busybox_rootfs
+        curl "$BUSYBOX_URL" > "$BUSYBOX_ARCHIVE"
+        echo "Extracting busybox..."
+        tar xf "$BUSYBOX_ARCHIVE"
+    fi
     pushd "$BUSYBOX" &>/dev/null
     # Build statically linked busybox.
     cp "$TEST_RESOURCE_DIR/busybox_static_config" .config
@@ -123,6 +128,7 @@ EOF
 /sbin/ip link set eth0 up
 /sbin/ip route add default via 192.168.241.1 dev eth0
 # Start http server.
+/bin/chmod +x /www/cgi-bin/*
 /usr/sbin/httpd -p 80 -h /www
 # Profit!
 setsid /bin/sh -c 'exec /bin/sh </dev/ttyS0 >/dev/ttyS0 2>&1'
@@ -136,17 +142,19 @@ make_initramfs() {
     kernel_dir="$1"
     halt="$2"
 
-    # Move to the directory with the kernel sources.
-    pushd "$kernel_dir" &>/dev/null
-
     # Prepare initramfs directory.
-    mkdir -p initramfs/{bin,dev,etc,home,mnt,proc,sys,usr}
+    mkdir -p "$kernel_dir"/initramfs/{bin,dev,etc,home,mnt,proc,sys,usr,www}
     # Copy busybox.
     echo "Copying busybox to the initramfs directory..."
-    cp -r busybox_rootfs/* initramfs/
+    cp -r "$kernel_dir"/busybox_rootfs/* "$kernel_dir"/initramfs/
+
+    # Add webserver files.
+    # TODO: this forces us to run with full abspath to the script. Sigh.
+    resdir=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+    cp -R "$resdir/www"/* "$kernel_dir"/initramfs/www/
 
     # Make a block device and a console.
-    pushd initramfs/dev &>/dev/null
+    pushd "$kernel_dir"/initramfs/dev &>/dev/null
     echo "Creating device nodes..."
     rm -f sda && mknod sda b 8 0
     rm -f console && mknod console c 5 1
@@ -157,18 +165,11 @@ make_initramfs() {
     chmod +x init
     fakeroot chown root init
 
-    # Add webserver files.
-    resdir=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
-    mkdir -p www
-    cp -R "$resdir/www"/* www/
-
     # Pack it up...
     echo "Packing initramfs.cpio..."
     find . | cpio -H newc -o > ../initramfs.cpio
     fakeroot chown root ../initramfs.cpio
 
-    # Return to kernel srcdir.
-    popd &>/dev/null
     # Return to previous directory.
     popd &>/dev/null
 }
