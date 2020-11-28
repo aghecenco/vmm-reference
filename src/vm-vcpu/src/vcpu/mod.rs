@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{kvm_fpu, kvm_regs, CpuId, Msrs};
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
-use vm_device::bus::PioAddress;
-use vm_device::device_manager::{IoManager, PioManager};
+use vm_device::bus::{MmioAddress, PioAddress};
+use vm_device::device_manager::{IoManager, MmioManager, PioManager};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryError};
 use vmm_sys_util::terminal::Terminal;
 
@@ -297,6 +297,28 @@ impl KvmVcpu {
                             } else if data.len() == 1 && addr == 0x61 {
                                 data[0] = 0x20;
                             }
+                        }
+                    }
+                    VcpuExit::MmioRead(addr, data) => {
+                        if self
+                            .device_mgr
+                            .lock()
+                            .unwrap()
+                            .mmio_read(MmioAddress(addr), data)
+                            .is_err()
+                        {
+                            eprintln!("Failed to read from mmio");
+                        }
+                    }
+                    VcpuExit::MmioWrite(addr, data) => {
+                        if self
+                            .device_mgr
+                            .lock()
+                            .unwrap()
+                            .mmio_write(MmioAddress(addr), data)
+                            .is_err()
+                        {
+                            eprintln!("Failed to write to mmio");
                         }
                     }
                     _ => {
