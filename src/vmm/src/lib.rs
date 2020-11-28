@@ -10,6 +10,8 @@ use std::convert::TryFrom;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, stdin, stdout};
+use std::ops::DerefMut;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use event_manager::{EventManager, MutEventSubscriber, SubscriberOps};
@@ -29,6 +31,7 @@ use linux_loader::loader::{
     elf::{self, Elf},
     load_cmdline, KernelLoader, KernelLoaderResult,
 };
+use vm_device::bus::{MmioAddress, MmioRange};
 use vm_device::device_manager::IoManager;
 use vm_device::resources::Resource;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
@@ -36,6 +39,9 @@ use vm_superio::Serial;
 use vm_vcpu::vcpu::{cpuid::filter_cpuid, VcpuState};
 use vm_vcpu::vm::{self, KvmVm, VmState};
 use vmm_sys_util::{eventfd::EventFd, terminal::Terminal};
+
+use devices::virtio::block::{Block, BlockArgs};
+use devices::virtio::{CommonArgs, MmioConfig};
 
 mod boot;
 use boot::build_bootparams;
@@ -124,7 +130,7 @@ pub struct VMM {
     // Arc<Mutex<>> because the same device (a dyn DevicePio/DeviceMmio from IoManager's
     // perspective, and a dyn MutEventSubscriber from EventManager's) is managed by the 2 entities,
     // and isn't Copy-able; so once one of them gets ownership, the other one can't anymore.
-    event_mgr: EventManager<Arc<Mutex<dyn MutEventSubscriber>>>,
+    event_mgr: EventManager<Arc<Mutex<dyn MutEventSubscriber + Send>>>,
 }
 
 impl TryFrom<VMMConfig> for VMM {
@@ -157,8 +163,12 @@ impl TryFrom<VMMConfig> for VMM {
             kernel_cfg: config.kernel_config.clone(),
         };
 
-        vmm.add_serial_console()?;
         vmm.create_vcpus(&config.vcpu_config)?;
+        vmm.add_serial_console()?;
+
+        if config.block_config.is_some() {
+            vmm.add_block_device(&config.block_config.unwrap()).unwrap();
+        }
 
         Ok(vmm)
     }
@@ -301,6 +311,34 @@ impl VMM {
         Ok(())
     }
 
+    fn add_block_device(&mut self, cfg: &BlockConfig) -> Result<()> {
+        let mem = Arc::new(self.guest_memory.clone());
+
+        let range = MmioRange::new(MmioAddress(MMIO_MEM_START), 0x1000).unwrap();
+        let mmio_cfg = MmioConfig { range, gsi: 5 };
+
+        let mut guard = self.device_mgr.lock().unwrap();
+
+        let common = CommonArgs {
+            mem,
+            vm_fd: self.vm.vm_fd(),
+            event_mgr: &mut self.event_mgr,
+            mmio_mgr: guard.deref_mut(),
+            mmio_cfg,
+            kernel_cmdline: &mut self.kernel_cfg.cmdline,
+        };
+
+        let args = BlockArgs {
+            common,
+            file_path: PathBuf::from(&cfg.path),
+        };
+
+        // We can also hold this somewhere if we need to keep the handle for later.
+        let _b = Block::new(args).expect("failed to create block");
+
+        Ok(())
+    }
+
     // Helper function that computes the kernel_load_addr needed by the
     // VcpuState when creating the Vcpus.
     fn compute_kernel_load_addr(&self, kernel_load: &KernelLoaderResult) -> Result<GuestAddress> {
@@ -407,6 +445,8 @@ mod tests {
                 size_mib: MEM_SIZE_MIB,
             },
             vcpu_config: VcpuConfig { num: NUM_VCPUS },
+            block_config: None,
+            network_config: None,
         }
     }
 
