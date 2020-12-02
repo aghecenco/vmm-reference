@@ -16,9 +16,9 @@ export TOP_PID=$$
 
 source "$TEST_RESOURCE_DIR/make_kernel.sh"
 
-KERNEL_VERSION="4.14.176"
+KERNEL_VERSION="5.4.81"
 
-KERNEL_CFG="microvm-kernel-initramfs-hello-x86_64.config"
+KERNEL_CFG="microvm-kernel-5.4-x86_64.config"
 
 # Reset index for cmdline arguments for the following `getopts`.
 OPTIND=1
@@ -91,14 +91,37 @@ extract_kernel_srcs "$KERNEL_VERSION"
 kernel_dir="$WORKDIR/linux-$KERNEL_VERSION"
 make_kernel_config "$TEST_RESOURCE_DIR/$KERNEL_CFG" "$kernel_dir"
 
-# Step 4: build kernel.
-make_kernel "$kernel_dir" "$KERNEL_FMT" "$MAKEPROCS" "$KERNEL_BINARY_NAME"
+# Step 4: build *.deb packages.
+# We could build them from the kernel sources with `make deb-pkg`, but the
+# `deb-pkg` target forces a `make clean`, so we'll just download them instead
+# of building the entire kernel over and over again.
+# If, however, you want to build them from scratch, set the `MAKEDEB` env var.
+mkdir -p "$kernel_dir/deb"
+if [ -n "$MAKEDEB" ]; then
+    echo "Building deb packages..."
+    make_kernel "$kernel_dir" "$KERNEL_FMT" "deb-pkg" "$MAKEPROCS"
+    cp "$kernel_dir"/../*.deb "$kernel_dir/deb"
+else
+    echo "Downloading deb packages..."
+    DEB_URL="http://security.ubuntu.com/ubuntu/pool/main/l/linux-hwe-5.4"
+    DEBS=(
+        "linux-modules-5.4.0-42-generic_5.4.0-42.46~18.04.1_amd64.deb"
+        "linux-image-unsigned-5.4.0-42-generic_5.4.0-42.46~18.04.1_amd64.deb"
+    )
+    for deb in "${DEBS[@]}"; do
+        wget -nc -P "$kernel_dir/deb" "$DEB_URL/$deb"
+    done
+fi
 
-# Step 5: build *.deb packages.
-make_kernel "$kernel_dir" "$KERNEL_FMT" "$MAKEPROCS" "$KERNEL_BINARY_NAME"
+# Step 5: build kernel.
+target=$(kernel_target "$KERNEL_FMT")
+make_kernel "$kernel_dir" "$KERNEL_FMT" "$target" "$MAKEPROCS" "$KERNEL_BINARY_NAME"
 
 # Final step: profit!
 echo "Done!"
 echo "Kernel binary placed in: $kernel_dir/$KERNEL_BINARY_NAME"
+echo ".deb packages placed in:"
+ls -1 "$kernel_dir"/deb/*.deb
+
 cleanup
 exit 0
